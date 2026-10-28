@@ -7,14 +7,16 @@ using UnityEditor;
 using UnityEditor.PackageManager.UI;
 using UnityEditor.SceneManagement;
 using UnityEngine;
+using UnityEngine.XR.Interaction.Toolkit.Inputs;
+using UnityEngine.XR.Interaction.Toolkit.Interactables;
 using UnityEngine.XR.Interaction.Toolkit.Locomotion.Teleportation;
 
 namespace Rufa.Editor
 {
     /// <summary>
     /// What a tutorial page can ask for ("> verifica: id args") and the buttons it can show ("> azione: label | id | args").
-    /// Prefab checks read the saved asset of the student's copy, never an instance or the clone in Play:
-    /// a change made only during Play is lost when Play stops, and it does not count here either.
+    /// Prefab checks read the saved asset of the student's copy, never an instance or the clone in Play, and scene checks
+    /// read the scene only out of Play: a change made only during Play is lost when Play stops, and it does not count here either.
     /// </summary>
     public static class LessonChecks
     {
@@ -43,25 +45,57 @@ namespace Rufa.Editor
             // On the surface of an area that does not accept its sides: aiming at the wall must not be a way up.
             ["sopra-area-filtrata"] = a => Checks["sopra-oggetto"](a) && Surface(a[0]).TryGetComponent(out TeleportationArea area) && area.filterSelectionByHitNormal,
             // On the named object or one of its children: an area on the disc of a pad counts as on the pad.
-            ["scena-vero"] = a => GameObject.Find(a[0]) is GameObject o && o.GetComponentsInChildren<Component>(true).FirstOrDefault(x => x != null && x.GetType().Name == a[1]) is Component c
-                                  && new SerializedObject(c).FindProperty(a[2]) is SerializedProperty p && p.boolValue == (a[3] == "sì"),
+            ["scena-vero"] = a => SceneProperty(a) is SerializedProperty p && p.boolValue == (a[3] == "sì"),
+            ["scena-numero"] = a => SceneProperty(a) is SerializedProperty p && Between(p.propertyType == SerializedPropertyType.Float ? p.floatValue : p.intValue, a[3], a[4]),
+            ["scena-riferimento"] = a => SceneProperty(a) is SerializedProperty p && p.objectReferenceValue != null,
+            ["scena-componente"] = a => !EditorApplication.isPlaying && SceneComponent(a[0], a[1]) != null,
+            // A persistent listener, set in the Inspector: a call added by a script at runtime does not count.
+            ["evento"] = a => SceneProperty(new[] { a[0], a[1], a[2] + ".m_PersistentCalls.m_Calls" }) is SerializedProperty calls
+                              && Enumerable.Range(0, calls.arraySize).Select(calls.GetArrayElementAtIndex)
+                                  .Any(c => c.FindPropertyRelative("m_MethodName").stringValue == a[3] && c.FindPropertyRelative("m_Target").objectReferenceValue != null),
+            // What a component is doing in Play: a door open, a trigger fired, a speed set from a menu.
+            ["stato"] = a => EditorApplication.isPlaying && SceneComponent(a[0], a[1]) is Component c && Member(c, a[2]) is object v
+                             && (v is bool b ? b == (a[3] == "sì") : Between(Convert.ToSingle(v), a[3], a[4])),
+            ["afferrato"] = a => EditorApplication.isPlaying && SceneComponent(a[0], nameof(XRGrabInteractable)) is XRGrabInteractable g && g.isSelected,
+            ["finestra-aperta"] = a => Resources.FindObjectsOfTypeAll<EditorWindow>().Any(w => w.titleContent.text == a[0]),
             ["componente-su"] = a => TypeNamed(a[0]) is Type t && Surface(a[1]) is Collider c
                                      && UnityEngine.Object.FindObjectsByType(t, FindObjectsSortMode.None).Any(x => CourseGoal.Above(c, ((Component)x).transform.position)),
             ["ambiente-intatto"] = a => GameObject.Find(a[0]) is GameObject o && o.TryGetComponent(out EnvironmentSnapshot s) && s.Changes().Count == 0,
             ["riuscito"] = a => GameObject.Find(a[0]) is GameObject o && o.TryGetComponent(out CourseGoal g) && g.reached,
+            // The measures of a blockout (LevelChecks), read on the colliders and only out of Play: a cure made in Play is lost when Play stops.
+            ["varco"] = a => !EditorApplication.isPlaying && GameObject.Find(a[0]) is GameObject m && LevelChecks.Width(m.transform) is float w && LevelChecks.Clearance(m.transform) is float h
+                             && Between(w, a[1], a[2]) && Between(h, a[3], a[4]),
+            ["altezza-libera"] = a => !EditorApplication.isPlaying && GameObject.Find(a[0]) is GameObject m && LevelChecks.Clearance(m.transform) is float h && Between(h, a[1], a[2]),
+            ["larghezza"] = a => !EditorApplication.isPlaying && GameObject.Find(a[0]) is GameObject m && LevelChecks.Width(m.transform) is float w && Between(w, a[1], a[2]),
+            ["percorso-liscio"] = a => !EditorApplication.isPlaying && GameObject.Find(a[0]) is GameObject from && GameObject.Find(a[1]) is GameObject to
+                                       && LevelChecks.Roughness(from.transform, to.transform) is float jump && jump <= Number(a[2]) + 0.0001f,
+            ["teleport-sotto"] = a => !EditorApplication.isPlaying && a.All(name => GameObject.Find(name) is GameObject m && LevelChecks.TeleportUnder(m.transform)),
+            ["rivolto-verso"] = a => !EditorApplication.isPlaying && GameObject.Find(a[0]) is GameObject o && GameObject.Find(a[1]) is GameObject t && LevelChecks.Facing(o.transform, t.transform) <= Number(a[2]),
+            ["luce-vicino"] = a => !EditorApplication.isPlaying && GameObject.Find(a[0]) is GameObject o && LevelChecks.LightNear(o.transform, Number(a[1])),
+            ["altezza"] = a => !EditorApplication.isPlaying && GameObject.Find(a[0]) is GameObject o && LevelChecks.Height(o.transform) is float y && Between(y, a[1], a[2]),
+            ["dimensione"] = a => !EditorApplication.isPlaying && GameObject.Find(a[0]) is GameObject o && LevelChecks.Size(o.transform, a[1]) is float s && Between(s, a[2], a[3]),
+            ["file-compilato"] = a => LevelChecks.FileFilled(Path.Combine(LevelChecks.Repository, a[0]), a[1]),
+            // The sky and the fog of the Lighting window: a panorama takes its depth from both
+            ["panorama"] = a => !EditorApplication.isPlaying && RenderSettings.skybox != null && RenderSettings.skybox.name == a[0]
+                                && RenderSettings.fog && RenderSettings.fogMode == FogMode.Linear && RenderSettings.fogEndDistance >= Number(a[1]),
+            ["mani-pronte"] = _ => HandsSetup.Ready(),
+            ["modalita-mani"] = _ => EditorApplication.isPlaying && XRInputModalityManager.currentInputMode.Value == XRInputModalityManager.InputMode.TrackedHand,
         };
 
         /// <summary>Where a Multi-Anchor Volume keeps its filter, the Destination Filter Object of its Destination Evaluation Settings.</summary>
         public const string GazeFilterField = "m_DestinationEvaluationSettings.m_ConstantValue.m_DestinationFilterObject";
 
         /// <summary>The checks that can pass only in Play: in a list chapter they stay done once they pass.</summary>
-        public static readonly HashSet<string> PlayOnly = new HashSet<string> { "in-play", "sopra-oggetto", "sopra-area-filtrata", "riuscito", "su-anchor" };
+        public static readonly HashSet<string> PlayOnly = new HashSet<string> { "in-play", "sopra-oggetto", "sopra-area-filtrata", "riuscito", "su-anchor", "stato", "afferrato", "modalita-mani" };
 
         static readonly Dictionary<string, Action<string[]>> Actions = new Dictionary<string, Action<string[]>>
         {
             ["importa-sample"] = a => ImportSample(a[0]),
             ["apri-scena"] = a => OpenSampleScene(a[0], a[1]),
             ["crea-progetto"] = _ => ProjectScene.Create(ProjectScene.Folder),
+            ["prepara-mani"] = _ => HandsSetup.Prepare(),
+            ["crea-concept"] = a => EditorUtility.OpenWithDefaultApp(LevelChecks.CreateConcept(a[0])),
+            ["riferimenti-scala"] = _ => LevelChecks.AddScaleReferences(),
         };
 
         public static bool Exists(string id) => Checks.ContainsKey(id) || Actions.ContainsKey(id);
@@ -98,6 +132,17 @@ namespace Rufa.Editor
             var component = child == null ? null : child.GetComponent(a[2]);
             return component == null ? null : new SerializedObject(component).FindProperty(a[3]);
         }
+
+        // On the named object (a path works too) or one of its children, by type name.
+        static Component SceneComponent(string name, string type) =>
+            GameObject.Find(name) is GameObject o ? o.GetComponentsInChildren<Component>(true).FirstOrDefault(x => x != null && x.GetType().Name == type) : null;
+
+        // Out of Play only: in Play the objects are copies, and what changes there is lost when Play stops.
+        static SerializedProperty SceneProperty(string[] a) =>
+            !EditorApplication.isPlaying && SceneComponent(a[0], a[1]) is Component c ? new SerializedObject(c).FindProperty(a[2]) : null;
+
+        // A public property or field, read in Play.
+        static object Member(Component c, string name) => c.GetType().GetProperty(name)?.GetValue(c) ?? c.GetType().GetField(name)?.GetValue(c);
 
         static Type TypeNamed(string name) => TypeCache.GetTypesDerivedFrom<Component>().FirstOrDefault(t => t.Name == name);
         // TryGetComponent: in the editor, GetComponent on a missing built-in component returns a stand-in that `is` accepts and that throws when used.
@@ -168,6 +213,7 @@ namespace Rufa.Editor
             Directory.CreateDirectory(SamplesRoot);
             FileUtil.CopyFileOrDirectory(sample.resolvedPath, SamplesRoot + "/" + displayName);
             AssetDatabase.Refresh();
+            HandsSetup.PrepareIfNeeded();   // a practice built on the rig with hands, copied by someone who skipped "Prepara le mani"
             return true;
         }
 
